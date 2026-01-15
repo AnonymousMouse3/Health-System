@@ -143,6 +143,8 @@ public class HealthSystem : MonoBehaviour, IDamageable
         else
         {
             OnSetBarFullPercent?.Invoke(healthbar, currentHealth, maxHealth);
+            
+            if (!lifestealHealthBar) return;
             OnSetBarFullPercent?.Invoke(lifestealHealthBar, currentHealth, maxHealth);
         }
     }
