@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 using MouseLib;
 using MyBox;
@@ -14,6 +15,9 @@ public class PassiveEffectManager : MonoBehaviour
     
     public List<PassiveEffectScriptableObject> activePassiveEffects;
     public List<ParticleSystem> activeParticleEffects;
+
+    [Header("Preset")]
+    public PassiveEffectScriptableObject liquidBurn;
 
     private void OnEnable()
     {
@@ -39,7 +43,7 @@ public class PassiveEffectManager : MonoBehaviour
     public void RemovePassiveEffect(PassiveEffectScriptableObject effect)
     {
         activePassiveEffects.Remove(effect);
-        effect.damageOverTimeTask = Task.CompletedTask;
+        effect.damageOverTimeCTS?.Cancel();
 
         foreach (ParticleSystem particleEffect in activeParticleEffects)
         {
@@ -69,13 +73,16 @@ public class PassiveEffectManager : MonoBehaviour
             targetHealthSystem.CurrentPassiveEffects.Add(effect);
         }
         
-        if (effect.appliesDamageOverTime && effect.targetHealthSystem)
+        if (effect.damageComponent.appliesDamageOverTime && effect.targetHealthSystem)
         {
-            effect.damageOverTimeTask = DamageOverTime(effect);
+            effect.damageOverTimeCTS = new CancellationTokenSource();
+            effect.damageOverTimeTask = DamageOverTime(effect.damageOverTimeCTS.Token, effect);
         }
 
         if (effect.appliesStun)
         {
+            effect.target.TryGetComponent(out MovementSystem targetMovementSystem);
+            
             ApplyStun();
         }
 
@@ -90,15 +97,17 @@ public class PassiveEffectManager : MonoBehaviour
         RemovePassiveEffect(effect);
     }
     
-    private async Task DamageOverTime(PassiveEffectScriptableObject effect)
+    private async Task DamageOverTime(CancellationToken ct, PassiveEffectScriptableObject effect)
     {
-        await MouseTools.AwaitableTimer(effect.damageTickDuration);
-        if (effect.damageOverTimeTask == Task.CompletedTask) return;
+        await MouseTools.AwaitableTimer(effect.damageComponent.damageTickDuration);
+        if (ct.IsCancellationRequested) return;
         
-        effect.targetHealthSystem.DoDamage(effect.damagePerTick);
+        // this uses simple damage and isn't compatible with manasteal or lifesteal
+        effect.targetHealthSystem.DoDamageByNumber(effect.damageComponent.damagePerTick);
         
 #pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
-        DamageOverTime(effect);
+        effect.damageOverTimeCTS = new CancellationTokenSource();
+        DamageOverTime(effect.damageOverTimeCTS.Token, effect);
 #pragma warning restore CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
     }
 

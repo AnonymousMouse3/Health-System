@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 using MyBox;
 using UnityEngine;
@@ -14,9 +15,7 @@ public class PassiveEffectScriptableObject : ScriptableObject
     public int id; // ENFORCE UNIQUE ID VIA EDITOR SCRIPT
     public float effectDuration;
 
-    public bool appliesDamageOverTime;
-    [ReadOnly(nameof(appliesDamageOverTime), true)] public float damagePerTick;
-    [ReadOnly(nameof(appliesDamageOverTime), true), Min(0.1f)] public float damageTickDuration;
+    public DamageComponent damageComponent;
     
     public bool appliesStun;
     public bool appliesFear;
@@ -56,5 +55,6 @@ public class PassiveEffectScriptableObject : ScriptableObject
     }
 
     public Task damageOverTimeTask;
+    public CancellationTokenSource damageOverTimeCTS;
     //public VFX?? effectVFX;
 }
