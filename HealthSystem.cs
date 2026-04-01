@@ -1,17 +1,20 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 using MouseLib;
 using MyBox;
+using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.UI;
 
 public interface IDamageable
 {
-    void DoDamage(float damage);
+    void DoDamage(DamageComponent damageComponent);
+    void DoDamageByNumber(float damage);
     
-    void DoHealing(float healing);
+    void DoHealingByNumber(float healing);
 }
 
 public class HealthSystem : MonoBehaviour, IDamageable
@@ -19,6 +22,8 @@ public class HealthSystem : MonoBehaviour, IDamageable
     public delegate void OnHandleProjectileHit();
     public static OnHandleProjectileHit onHandleProjectileHit;
     
+    public static event Action<GameObject, HealthSystem, DamageComponent> OnDamage; // Gameobject character that was damaged, their HealthSystem, attacking DamageComponent
+    public static event Action<GameObject, HealthSystem, float> OnHeal;
     public static event Action<GameObject, GameObject> OnDeath;
     public static event Action<float, float> OnPlayerHealthChanged; // arg1 = currentHealth. arg2 = maxHealth.
     public static event Action<Image, float, float> OnSetBarFullPercent;
@@ -78,6 +83,7 @@ public class HealthSystem : MonoBehaviour, IDamageable
     [SerializeField, ReadOnly] private bool isDead;
     [SerializeField] private bool isInvulnerable;
     [SerializeField] private bool destroyOnDeath;
+    [SerializeField] public bool isSanctuary;
     
     [Separator("Lifeleech")]
     [SerializeField] private bool canLeechLife;
@@ -100,19 +106,38 @@ public class HealthSystem : MonoBehaviour, IDamageable
     
     [Separator("Particles")]
     [SerializeField] ParticleSystem onDeathParticles;
+    [SerializeField] ParticleSystem manastealParticles;
+    [SerializeField] ParticleSystem lifestealParticles;
     
     [Separator("UI")]
     [SerializeField] Image healthbar;
     [SerializeField] Image lifestealHealthBar;
     
     private Task overhealDecayTask;
+    private CancellationTokenSource overhealDecayCTS;
     
+    private Task manastealQueueTask;
+    private CancellationTokenSource manastealQueueCTS;
+    private int burstSize;
+
+    void OnEnable()
+    {
+        
+    }
+
+    void OnDisable()
+    {
+        
+    }
+
     // Start is called once before the first execution of Update after the MonoBehaviour is created
     void Start()
     {
         if (initializeManually) return;
 
         InitializeHealthSystem();
+
+        effectManager = GameObject.Find("Game Manager").GetComponent<PassiveEffectManager>();
     }
 
     public void InitializeHealthSystem()
@@ -143,8 +168,6 @@ public class HealthSystem : MonoBehaviour, IDamageable
         else
         {
             OnSetBarFullPercent?.Invoke(healthbar, currentHealth, maxHealth);
-            
-            if (!lifestealHealthBar) return;
             OnSetBarFullPercent?.Invoke(lifestealHealthBar, currentHealth, maxHealth);
         }
     }
@@ -153,12 +176,16 @@ public class HealthSystem : MonoBehaviour, IDamageable
     /// Updates the stealable aether bar when stolen.
     /// </summary>
     /// <param name="healthStolen">The amount of aether leached.</param>
-    public void OnHealthLeeched()
+    public void OnHealthLeeched(float healthHealed)
     {
         lifestealHealth = 0f;
         
-       UpdateHealthbarUI();
+        UpdateHealthbarUI();
         
+        #if SPELL_SYSTEM
+        SpawnLifestealParticles(healthHealed);
+        #endif        
+
         if (!isAfterlifeOrb) return;
         Destroy(gameObject);
     }
@@ -179,15 +206,42 @@ public class HealthSystem : MonoBehaviour, IDamageable
         OnSetBarFullPercent?.Invoke(lifestealHealthBar, currentHealth + lifestealHealth, maxHealth);
     }
 
-    public void DoDamage(float damage)
+    public void DoDamage(DamageComponent damageComponent)
+    {
+        if (isInvulnerable) return;
+        if (trainerMode){ timeTillHeal = 5; }
+        
+        #if SPELL_SYSTEM
+        // only if spell
+        if (damageComponent.enableLifesteal)
+        {
+            lifestealHealth += Mathf.Clamp(damageComponent.baseDamage, 0, currentHealth);
+        }
+        
+        // only if gun
+        if (damageComponent.enableManasteal)
+        {
+            QueueManastealParticles(damageComponent);
+        }
+        #endif
+        
+        currentHealth -= damageComponent.baseDamage;
+        currentHealth = Mathf.Clamp(currentHealth, 0, maxHealth);
+        
+        UpdateHealthbarUI();
+        OnDamage?.Invoke(gameObject, this, damageComponent);
+        
+        if (currentHealth > 0) return;
+        DoDeath();
+    }
+    
+    public void DoDamageByNumber(float damage)
     {
         if (isInvulnerable) return;
         if (trainerMode){ timeTillHeal = 5; }
         
         currentHealth -= damage;
         currentHealth = Mathf.Clamp(currentHealth, 0, maxHealth);
-
-        lifestealHealth += damage;
         
         UpdateHealthbarUI();
         
@@ -195,7 +249,7 @@ public class HealthSystem : MonoBehaviour, IDamageable
         DoDeath();
     }
 
-    public void DoHealing(float healing)
+    public void DoHealingByNumber(float healing)
     {
         currentHealth += healing;
 
@@ -208,9 +262,10 @@ public class HealthSystem : MonoBehaviour, IDamageable
         }
 
         if (currentHealth <= maxHealth) return;
-        if (overhealDecayTask != Task.CompletedTask) return;
         
-        overhealDecayTask = DecayOverheal();
+        overhealDecayCTS?.Cancel();
+        overhealDecayCTS = new CancellationTokenSource();
+        overhealDecayTask = DecayOverheal(overhealDecayCTS.Token);
     }
 
     public void DoDeath()
@@ -218,6 +273,7 @@ public class HealthSystem : MonoBehaviour, IDamageable
         if (isDead) return;
         if (isInvulnerable) return;
         if (trainerMode) return;
+        if (isSanctuary){currentHealth = 1; return;}
 
         isDead = true;
         OnDeath?.Invoke(gameObject, gameObject);
@@ -243,9 +299,10 @@ public class HealthSystem : MonoBehaviour, IDamageable
         gameObject.SetActive(false);
     }
 
-    private async Task DecayOverheal()
+    private async Task DecayOverheal(CancellationToken ct)
     {
         await MouseTools.AwaitableTimer(overhealDecayInterval);
+        if (ct.IsCancellationRequested) return;
         
         if (currentHealth <= maxHealth) return;
         currentHealth -= overhealDecayIncrement;
@@ -253,7 +310,8 @@ public class HealthSystem : MonoBehaviour, IDamageable
         currentHealth = Mathf.Clamp(currentHealth, 0, overhealMax);
 
 #pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
-        DecayOverheal();
+        overhealDecayCTS = new CancellationTokenSource();
+        DecayOverheal(overhealDecayCTS.Token);
 #pragma warning restore CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
     }
     
@@ -261,7 +319,7 @@ public class HealthSystem : MonoBehaviour, IDamageable
     {
         if (trainerMode && timeTillHeal <= 0)
         {
-            DoHealing(maxHealth);
+            DoHealingByNumber(maxHealth);
             UpdateHealthbarUI();
             timeTillHeal = 5;
         }
@@ -270,4 +328,80 @@ public class HealthSystem : MonoBehaviour, IDamageable
         yield return new WaitForSeconds(1f);
         StartCoroutine(TrainerMode());
     }
+
+    void Update()
+    {
+        isSanctuary = false;
+    }
+
+    public int CheckForPassive(int id)
+    {
+        for (int i = 0; i < currentPassiveEffects.Count; i++)
+        {
+            if (currentPassiveEffects[i].id == id)
+            {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private PassiveEffectManager effectManager;
+    void OnCollisionStay(Collision other)
+    {
+        #if SPELL_SYSTEM
+        if (other.gameObject.tag == "Liquid")
+        {
+            Liquid liquid = other.gameObject.GetComponent<LiquidV2Liquid>().liquid;
+
+            if (liquid == Liquid.water)
+            {
+                if (CheckForPassive(1) != -1)
+                {
+                    effectManager.RemovePassiveEffect(CurrentPassiveEffects[CheckForPassive(1)]);
+                }
+            }
+            if (liquid == Liquid.fire)
+            {
+                if (CheckForPassive(1) == -1)
+                {
+                    Debug.Log("A");
+                    effectManager.AddPassiveEffect(effectManager.liquidBurn, this.gameObject);
+                }
+            }
+        }
+        #endif
+    }
+    
+    #if SPELL_SYSTEM
+    private void QueueManastealParticles(DamageComponent damageComponent)
+    {
+        if (!manastealParticles) return;
+
+        int manaRestored = Mathf.Clamp(Mathf.RoundToInt(damageComponent.baseDamage * damageComponent.manastealMultiplier), 1, 99999);
+        burstSize += manaRestored;
+        
+        manastealQueueCTS?.Cancel();
+        manastealQueueCTS = new CancellationTokenSource();
+        manastealQueueTask = SpawnManastealParticles(manastealQueueCTS.Token);
+    }
+
+    private async Task SpawnManastealParticles(CancellationToken ct)
+    {
+        if (!manastealParticles) return;
+        
+        await MouseTools.AwaitableTimer(0.05f);
+        if (ct.IsCancellationRequested) return;
+        
+        manastealParticles.emission.SetBurst(0, new ParticleSystem.Burst(0.0f, burstSize, 1, 0.03f));
+        manastealParticles.Play();
+        burstSize = 0;
+    }
+
+    private void SpawnLifestealParticles(float healthHealed)
+    {
+        lifestealParticles.emission.SetBurst(0, new ParticleSystem.Burst(0.0f, healthHealed, 1, 0.03f));
+        lifestealParticles.Play();
+    }
+    #endif
 }
