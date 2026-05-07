@@ -137,6 +137,7 @@ public class HealthSystem : MonoBehaviour, IDamageable
 
         InitializeHealthSystem();
 
+        // todo why is this a thing? put them on each afflicted object
         effectManager = GameObject.Find("Game Manager").GetComponent<PassiveEffectManager>();
     }
 
